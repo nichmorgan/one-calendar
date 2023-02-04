@@ -5,10 +5,11 @@ from urllib.parse import urljoin
 from datetime import datetime, time
 from dateutil.rrule import rrule, MONTHLY
 from dataclasses import dataclass
+import re
 import json
 
 
-def get_page_from_link(url: str, **kwargs) -> BeautifulSoup:
+def get_soup_from_link(url: str, **kwargs) -> BeautifulSoup:
     response = requests.get(url, **kwargs)
     response.raise_for_status()
 
@@ -39,7 +40,7 @@ class CalendarScrapper:
 
     def __get_month(self, date: datetime) -> ResultSet:
         url = urljoin(self.__base_url, "/calendario")
-        calendar_page = get_page_from_link(
+        calendar_page = get_soup_from_link(
             url, params={"month": date.strftime("%Y-%m")}
         )
         return calendar_page.find_all(self.__event_filter)
@@ -54,102 +55,108 @@ class CalendarScrapper:
 
 
 @dataclass
-class EventHeader:
-    name: str
-    date: datetime
-    venue: str
-    category: str
-
-
-@dataclass
-class EventBody:
-    sponsor: str
-    period: str
-    start_hour: Optional[time]
-    sub_venue: Optional[str]
-
-
-@dataclass
 class Event:
     name: str
     sponsor: str
     start_date: datetime
+    end_date: Optional[datetime]
     category: str
     period: str
     venue: str
     sub_venue: str
 
-    @classmethod
-    def from_components(
-        cls: Type["Event"],
-        body: EventBody,
-        header: EventHeader,
-    ) -> "Event":
-        start_date = datetime(header.date.year, header.date.month, header.date.day)
-        if body.start_hour:
-            start_date.hour = body.start_hour.hour
-            start_date.minute = body.start_hour.minute
+    @staticmethod
+    def datetime_from_str(value: str) -> datetime:
+        if "T" in value:
+            return datetime.fromisoformat(value)
+        else:
+            return datetime.strptime(value, "%Y-%m-%d")
 
-        return cls(
-            name=header.name,
-            start_date=start_date,
-            category=header.category,
-            venue=header.venue,
-            sponsor=body.sponsor,
-            period=body.period,
-            sub_venue=body.sub_venue,
+    @staticmethod
+    def period_from_datetime(value: datetime) -> str:
+        if value.hour < 12:
+            return "Manhã"
+        elif value.hour < 18:
+            return "Tarde"
+        elif value.hour < 24:
+            return "Noite"
+        else:
+            return "Indefinido"
+
+    @staticmethod
+    def sponsor_from_description(description: str) -> Optional[str]:
+        search = re.search(
+            "(?<=Responsável:) *(?P<sponsor>.*?) *(?=Período:)",
+            description,
         )
+        if search:
+            return search.groupdict()["sponsor"]
+        return None
+
+    @staticmethod
+    def subvenue_from_description(description: str) -> Optional[str]:
+        sub_venue_details_search = re.search(
+            "((?<=Detalhes do local:)|(?<=Local 2:)) *(\\xa0)?(?P<sub_venue>.*?) *$",
+            description,
+        )
+        if sub_venue_details_search:
+            return sub_venue_details_search.groupdict().get("sub_venue", None)
+
+        return None
+
+    @classmethod
+    def from_head_script_content(cls: Type["Event"], content: dict) -> "Event":
+        description = content["description"].replace("\xa0", "")
+
+        name = content["name"]
+        category = content["@type"]
+        start_date = cls.datetime_from_str(content["startDate"])
+        if content["endDate"]:
+            end_date = cls.datetime_from_str(content["endDate"])
+        else:
+            end_date = None
+        period = cls.period_from_datetime(start_date)
+        venue = content["location"]["name"]
+
+        sponsor = cls.sponsor_from_description(description)
+
+        subvenue_from_description = cls.subvenue_from_description(description)
+        if subvenue_from_description:
+            sub_venue = subvenue_from_description
+        else:
+            sub_venue = content["location"]["address"]["streetAddress"]
+
+        event = cls(
+            name=name,
+            category=category,
+            start_date=start_date,
+            end_date=end_date,
+            period=period,
+            sponsor=sponsor,
+            venue=venue,
+            sub_venue=sub_venue,
+        )
+        return event
 
 
 class EventScrapper:
-    def __get_event_header(self) -> EventHeader:
-        data_str = (
+    def get_event_from_link(self, url: str) -> Event:
+        self.__page = get_soup_from_link(url)
+        script_content = json.loads(
             self.__page.head.find_all("script", attrs={"type": "application/ld+json"})
             .pop()
             .text
         )
-        data = json.loads(data_str)
-        data["startDate"] = datetime.strptime(data["startDate"], "%Y-%m-%d")
-        return EventHeader(
-            name=data["name"],
-            date=data["startDate"],
-            venue=data["location"]["name"],
-            category=data["@type"],
-        )
 
-    def __get_event_body(self) -> EventBody:
-        body_content = self.__page.find(id="jubilee-event-content").text.strip()
-        body_dict = {}
-        for line in body_content.splitlines():
-            key, value = line.split(":")
-            body_dict[key.strip()] = value.strip() or None
-
-        if body_dict["Hora inicial"]:
-            hours, minutes = map(
-                int,
-                body_dict["Hora inicial"].split(":", maxsplit=2)[:2],
-            )
-            body_dict["Hora inicial"] = time(hours, minutes)
-
-        if "Local 2" in body_dict:
-            body_dict["Local"] = body_dict.pop("Local 2")
-
-        return EventBody(
-            sponsor=body_dict["Responsável"],
-            period=body_dict["Período"],
-            start_hour=body_dict["Hora inicial"],
-            sub_venue=body_dict["Local"],
-        )
-
-    def get_event_from_link(self, url: str) -> Event:
-        self.__page = get_page_from_link(url)
-
-        body = self.__get_event_body()
-        header = self.__get_event_header()
-        return Event.from_components(body, header)
+        return Event.from_head_script_content(script_content)
 
 
-event = EventScrapper().get_event_from_link(
-    "https://ipsantoamaro.com.br/eventos/jogupa-koinonia-evangelismo-uppa-e-upa/"
-)
-# event_links = CalendarScrapper().get_events_links_between_dates(datetime(2023, 12, 31))
+event_links = CalendarScrapper().get_events_links_between_dates(datetime(2023, 12, 31))[
+    :10
+]
+scrapper = EventScrapper()
+events_list = []
+for link in event_links:
+    event = scrapper.get_event_from_link(link)
+    events_list.append(event)
+print(events_list)
