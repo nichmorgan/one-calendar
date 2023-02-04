@@ -5,13 +5,14 @@ from urllib.parse import urljoin
 from datetime import datetime, time
 from dateutil.rrule import rrule, MONTHLY
 from dataclasses import dataclass
+import json
 
 
 def get_page_from_link(url: str, **kwargs) -> BeautifulSoup:
     response = requests.get(url, **kwargs)
     response.raise_for_status()
 
-    return BeautifulSoup(response.text, "html.parser")
+    return BeautifulSoup(response.text, "lxml")
 
 
 class CalendarScrapper:
@@ -54,6 +55,7 @@ class CalendarScrapper:
 
 @dataclass
 class EventHeader:
+    name: str
     date: datetime
     venue: str
     category: str
@@ -69,6 +71,7 @@ class EventBody:
 
 @dataclass
 class Event:
+    name: str
     sponsor: str
     start_date: datetime
     category: str
@@ -82,15 +85,13 @@ class Event:
         body: EventBody,
         header: EventHeader,
     ) -> "Event":
-        start_date = datetime(
-            header.date.year,
-            header.date.month,
-            header.date.day,
-            body.start_hour.hour,
-            body.start_hour.minute,
-        )
+        start_date = datetime(header.date.year, header.date.month, header.date.day)
+        if body.start_hour:
+            start_date.hour = body.start_hour.hour
+            start_date.minute = body.start_hour.minute
 
         return cls(
+            name=header.name,
             start_date=start_date,
             category=header.category,
             venue=header.venue,
@@ -101,24 +102,19 @@ class Event:
 
 
 class EventScrapper:
-    def __get_event_header_date(self) -> datetime:
-        #! TODO: Falha em encontrar esta tag!
-        date_str = self.__page.find(class_="jubilee-event-date-label").text
-        # ? Get the first part from datetime, the hour is trash, ex.: 28/01/2023 00:00
-        date_str = date_str.strip().split(maxsplit=1)[0]
-        return datetime.strptime(date_str, "%d/%M/%Y")
-
-    def __get_event_header_venue(self) -> str:
-        return self.__page.find(id="jubilee-event-venue").text.strip()
-
-    def __get_event_header_category(self) -> str:
-        return self.__page.find(id="jubilee-event-category").text.strip()
-
     def __get_event_header(self) -> EventHeader:
+        data_str = (
+            self.__page.head.find_all("script", attrs={"type": "application/ld+json"})
+            .pop()
+            .text
+        )
+        data = json.loads(data_str)
+        data["startDate"] = datetime.strptime(data["startDate"], "%Y-%m-%d")
         return EventHeader(
-            date=self.__get_event_header_date(),
-            venue=self.__get_event_header_venue(),
-            category=self.__get_event_header_category(),
+            name=data["name"],
+            date=data["startDate"],
+            venue=data["location"]["name"],
+            category=data["@type"],
         )
 
     def __get_event_body(self) -> EventBody:
@@ -126,7 +122,7 @@ class EventScrapper:
         body_dict = {}
         for line in body_content.splitlines():
             key, value = line.split(":")
-            body_dict[key] = value.strip() or None
+            body_dict[key.strip()] = value.strip() or None
 
         if body_dict["Hora inicial"]:
             hours, minutes = map(
@@ -135,11 +131,14 @@ class EventScrapper:
             )
             body_dict["Hora inicial"] = time(hours, minutes)
 
+        if "Local 2" in body_dict:
+            body_dict["Local"] = body_dict.pop("Local 2")
+
         return EventBody(
             sponsor=body_dict["Responsável"],
             period=body_dict["Período"],
             start_hour=body_dict["Hora inicial"],
-            sub_venue=body_dict["Local 2"],
+            sub_venue=body_dict["Local"],
         )
 
     def get_event_from_link(self, url: str) -> Event:
@@ -150,8 +149,7 @@ class EventScrapper:
         return Event.from_components(body, header)
 
 
-EventScrapper().get_event_from_link(
+event = EventScrapper().get_event_from_link(
     "https://ipsantoamaro.com.br/eventos/jogupa-koinonia-evangelismo-uppa-e-upa/"
 )
-
 # event_links = CalendarScrapper().get_events_links_between_dates(datetime(2023, 12, 31))
